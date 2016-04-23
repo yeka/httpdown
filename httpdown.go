@@ -36,6 +36,17 @@ type Server interface {
 	Stop() error
 }
 
+type ConnStateFunc func(net.Conn, http.ConnState)
+
+type NetServer interface {
+	GetAddr() string
+	GetTLSConfig() *tls.Config
+	SetKeepAlivesEnabled(bool)
+	Serve(net.Listener) error
+	GetConnState() ConnStateFunc
+	SetConnState(ConnStateFunc)
+}
+
 // HTTP defines the configuration for serving a http.Server. Multiple calls to
 // Serve or ListenAndServe can be made on the same HTTP instance. The default
 // timeouts of 1 minute each result in a maximum of 2 minutes before a Stop()
@@ -61,7 +72,7 @@ type HTTP struct {
 
 // Serve provides the low-level API which is useful if you're creating your own
 // net.Listener.
-func (h HTTP) Serve(s *http.Server, l net.Listener) Server {
+func (h HTTP) Serve(s NetServer, l net.Listener) Server {
 	stopTimeout := h.StopTimeout
 	if stopTimeout == 0 {
 		stopTimeout = defaultStopTimeout
@@ -80,7 +91,7 @@ func (h HTTP) Serve(s *http.Server, l net.Listener) Server {
 		killTimeout:  killTimeout,
 		stats:        h.Stats,
 		clock:        klock,
-		oldConnState: s.ConnState,
+		oldConnState: s.GetConnState(),
 		listener:     l,
 		server:       s,
 		serveDone:    make(chan struct{}),
@@ -92,7 +103,7 @@ func (h HTTP) Serve(s *http.Server, l net.Listener) Server {
 		stop:         make(chan chan struct{}),
 		kill:         make(chan chan struct{}),
 	}
-	s.ConnState = ss.connState
+	s.SetConnState(ss.connState)
 	go ss.manage()
 	go ss.serve()
 	return ss
@@ -102,10 +113,10 @@ func (h HTTP) Serve(s *http.Server, l net.Listener) Server {
 // to ListenAndServe from the standard library, but returns immediately.
 // Requests will be accepted in a background goroutine. If the http.Server has
 // a non-nil TLSConfig, a TLS enabled listener will be setup.
-func (h HTTP) ListenAndServe(s *http.Server) (Server, error) {
-	addr := s.Addr
+func (h HTTP) ListenAndServe(s NetServer) (Server, error) {
+	addr := s.GetAddr()
 	if addr == "" {
-		if s.TLSConfig == nil {
+		if s.GetTLSConfig() == nil {
 			addr = ":http"
 		} else {
 			addr = ":https"
@@ -116,8 +127,8 @@ func (h HTTP) ListenAndServe(s *http.Server) (Server, error) {
 		stats.BumpSum(h.Stats, "listen.error", 1)
 		return nil, err
 	}
-	if s.TLSConfig != nil {
-		l = tls.NewListener(l, s.TLSConfig)
+	if s.GetTLSConfig() != nil {
+		l = tls.NewListener(l, s.GetTLSConfig())
 	}
 	return h.Serve(s, l), nil
 }
@@ -130,7 +141,7 @@ type server struct {
 	clock       clock.Clock
 
 	oldConnState func(net.Conn, http.ConnState)
-	server       *http.Server
+	server       NetServer
 	serveDone    chan struct{}
 	serveErr     chan error
 	listener     net.Listener
@@ -340,7 +351,7 @@ func isUseOfClosedError(err error) bool {
 
 // ListenAndServe is a convenience function to serve and wait for a SIGTERM
 // or SIGINT before shutting down.
-func ListenAndServe(s *http.Server, hd *HTTP) error {
+func ListenAndServe(s NetServer, hd *HTTP) error {
 	if hd == nil {
 		hd = &HTTP{}
 	}
