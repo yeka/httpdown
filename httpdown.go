@@ -15,6 +15,8 @@ import (
 
 	"github.com/facebookgo/clock"
 	"github.com/facebookgo/stats"
+	"github.com/yeka/httpdown/netserver"
+	"github.com/yeka/httpdown/netserver/wrapper"
 )
 
 const (
@@ -63,16 +65,20 @@ type HTTP struct {
 	KillTimeout time.Duration
 
 	// Stats is optional. If provided, it will be used to record various metrics.
-	Stats stats.Client
+	Stats       stats.Client
 
 	// Clock allows for testing timing related functionality. Do not specify this
 	// in production code.
-	Clock clock.Clock
+	Clock       clock.Clock
 }
 
 // Serve provides the low-level API which is useful if you're creating your own
 // net.Listener.
-func (h HTTP) Serve(s NetServer, l net.Listener) Server {
+func (h HTTP) Serve(s *http.Server, l net.Listener) Server {
+	return h.ServeNetServer(&wrapper.HTTPServer{s}, l)
+}
+
+func (h HTTP) ServeNetServer(s netserver.NetServer, l net.Listener) Server {
 	stopTimeout := h.StopTimeout
 	if stopTimeout == 0 {
 		stopTimeout = defaultStopTimeout
@@ -113,7 +119,11 @@ func (h HTTP) Serve(s NetServer, l net.Listener) Server {
 // to ListenAndServe from the standard library, but returns immediately.
 // Requests will be accepted in a background goroutine. If the http.Server has
 // a non-nil TLSConfig, a TLS enabled listener will be setup.
-func (h HTTP) ListenAndServe(s NetServer) (Server, error) {
+func (h HTTP) ListenAndServe(s *http.Server) (Server, error) {
+	return h.ListenAndServeNetServer(&wrapper.HTTPServer{s})
+}
+
+func (h HTTP) ListenAndServeNetServer(s netserver.NetServer) (Server, error) {
 	addr := s.GetAddr()
 	if addr == "" {
 		if s.GetTLSConfig() == nil {
@@ -130,31 +140,31 @@ func (h HTTP) ListenAndServe(s NetServer) (Server, error) {
 	if s.GetTLSConfig() != nil {
 		l = tls.NewListener(l, s.GetTLSConfig())
 	}
-	return h.Serve(s, l), nil
+	return h.ServeNetServer(s, l), nil
 }
 
 // server manages the serving process and allows for gracefully stopping it.
 type server struct {
-	stopTimeout time.Duration
-	killTimeout time.Duration
-	stats       stats.Client
-	clock       clock.Clock
+	stopTimeout  time.Duration
+	killTimeout  time.Duration
+	stats        stats.Client
+	clock        clock.Clock
 
 	oldConnState func(net.Conn, http.ConnState)
-	server       NetServer
+	server       netserver.NetServer
 	serveDone    chan struct{}
 	serveErr     chan error
 	listener     net.Listener
 
-	new    chan net.Conn
-	active chan net.Conn
-	idle   chan net.Conn
-	closed chan net.Conn
-	stop   chan chan struct{}
-	kill   chan chan struct{}
+	new          chan net.Conn
+	active       chan net.Conn
+	idle         chan net.Conn
+	closed       chan net.Conn
+	stop         chan chan struct{}
+	kill         chan chan struct{}
 
-	stopOnce sync.Once
-	stopErr  error
+	stopOnce     sync.Once
+	stopErr      error
 }
 
 func (s *server) connState(c net.Conn, cs http.ConnState) {
@@ -214,11 +224,11 @@ func (s *server) manage() {
 	for {
 		select {
 		case <-statsTicker.C:
-			// we'll only get here when s.stats is not nil
+		// we'll only get here when s.stats is not nil
 			s.stats.BumpAvg("http-state.new", countNew)
 			s.stats.BumpAvg("http-state.active", countActive)
 			s.stats.BumpAvg("http-state.idle", countIdle)
-			s.stats.BumpAvg("http-state.total", countNew+countActive+countIdle)
+			s.stats.BumpAvg("http-state.total", countNew + countActive + countIdle)
 		case c := <-s.new:
 			conns[c] = http.StateNew
 			countNew++
@@ -233,7 +243,7 @@ func (s *server) manage() {
 
 			conns[c] = http.StateIdle
 
-			// if we're already stopping, close it
+		// if we're already stopping, close it
 			if stopDone != nil {
 				c.Close()
 			}
@@ -242,42 +252,42 @@ func (s *server) manage() {
 			decConn(c)
 			delete(conns, c)
 
-			// if we're waiting to stop and are all empty, we just closed the last
-			// connection and we're done.
+		// if we're waiting to stop and are all empty, we just closed the last
+		// connection and we're done.
 			if stopDone != nil && len(conns) == 0 {
 				close(stopDone)
 				return
 			}
 		case stopDone = <-s.stop:
-			// if we're already all empty, we're already done
+		// if we're already all empty, we're already done
 			if len(conns) == 0 {
 				close(stopDone)
 				return
 			}
 
-			// close current idle connections right away
+		// close current idle connections right away
 			for c, cs := range conns {
 				if cs == http.StateIdle {
 					c.Close()
 				}
 			}
 
-			// continue the loop and wait for all the ConnState updates which will
-			// eventually close(stopDone) and return from this goroutine.
+		// continue the loop and wait for all the ConnState updates which will
+		// eventually close(stopDone) and return from this goroutine.
 
 		case killDone := <-s.kill:
-			// force close all connections
+		// force close all connections
 			stats.BumpSum(s.stats, "kill.conn.count", float64(len(conns)))
 			for c := range conns {
 				c.Close()
 			}
 
-			// don't block the kill.
+		// don't block the kill.
 			close(killDone)
 
-			// continue the loop and we wait for all the ConnState updates and will
-			// return from this goroutine when we're all done. otherwise we'll try to
-			// send those ConnState updates on closed channels.
+		// continue the loop and we wait for all the ConnState updates and will
+		// return from this goroutine when we're all done. otherwise we'll try to
+		// send those ConnState updates on closed channels.
 
 		}
 	}
@@ -320,15 +330,15 @@ func (s *server) Stop() error {
 			defer stats.BumpTime(s.stats, "kill.time").End()
 			stats.BumpSum(s.stats, "kill", 1)
 
-			// stop timed out, wait for kill
+		// stop timed out, wait for kill
 			killDone := make(chan struct{})
 			s.kill <- killDone
-			select {
-			case <-killDone:
-			case <-s.clock.After(s.killTimeout):
+				select {
+				case <-killDone:
+				case <-s.clock.After(s.killTimeout):
 				// kill timed out, give up
-				stats.BumpSum(s.stats, "kill.timeout", 1)
-			}
+					stats.BumpSum(s.stats, "kill.timeout", 1)
+				}
 		}
 
 		if closeErr != nil && !isUseOfClosedError(closeErr) {
@@ -351,11 +361,15 @@ func isUseOfClosedError(err error) bool {
 
 // ListenAndServe is a convenience function to serve and wait for a SIGTERM
 // or SIGINT before shutting down.
-func ListenAndServe(s NetServer, hd *HTTP) error {
+func ListenAndServe(s *http.Server, hd *HTTP) error {
+	return ListenAndServeNetServer(&wrapper.HTTPServer{s}, hd)
+}
+
+func ListenAndServeNetServer(s netserver.NetServer, hd *HTTP) error {
 	if hd == nil {
 		hd = &HTTP{}
 	}
-	hs, err := hd.ListenAndServe(s)
+	hs, err := hd.ListenAndServeNetServer(s)
 	if err != nil {
 		return err
 	}
